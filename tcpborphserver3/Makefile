@@ -24,13 +24,13 @@ all: $(SERVER)
 
 #$(SERVER): $(OBJ) 
 $(SERVER): $(OBJ) $(KATCP)/libkatcp.a
-	$(CC) -DRPI_VERSION=$(RPI) -o $@ $(OBJ) $(LIB)
+	$(CC) -o $@ $(OBJ) $(LIB)
 
 clean: 
 	$(RM) -f $(SERVER) *.o test-*
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@ $(INC)
+	$(CC) -DRPI_VERSION=$(RPI) $(CFLAGS) -c $< -o $@ $(INC)
 
 # Ensure that kcpfpg gets installed
 install: all
