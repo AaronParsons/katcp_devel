@@ -166,7 +166,7 @@ int bulk_read(int fd, uint32_t start_addr, unsigned int n_bytes, uint32_t *buf)
 
         }
 
-        //printf("Sending SPI message burst %d n_messages: %d\n", n, m);
+        //printf("\nSending SPI message burst %d n_messages: %d\n", n, m);
 	    spidev_ret = ioctl(fd, SPI_IOC_MESSAGE(m), tr);
     	if (spidev_ret < 1)
         {
