@@ -8,7 +8,7 @@ LIB = -L$(KATCP) -lkatcp -ldl -lz
 CFLAGS += -fPIC
 CFLAGS += -ggdb
 #CFLAGS += -DDEBUG=2
-CFLAGS += -DDEBUG
+#CFLAGS += -DDEBUG
 #CFLAGS += -DPROFILE
 # crash rather than limp on 
 #CFLAGS += -DFAILFAST
@@ -40,3 +40,4 @@ install: all
 test-bof: bof.c 
 	$(CC) $(CFLAGS) -DSTANDALONE -o $@ $^ -I../katcp
 
+print-%  : ; @echo $* = $($*)
