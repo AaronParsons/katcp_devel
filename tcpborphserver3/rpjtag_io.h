@@ -1,35 +1,11 @@
 #ifndef RPJTAG_IO_H
 #define RPJTAG_IO_H
 
-#include <stdlib.h>
-#include <sys/mman.h>
 #include <stdio.h>
-#include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-#define PAGE_SIZE (4*1024)
-#define BLOCK_SIZE (4*1024)
-
-//#define RPI_VERSION 4
-#if RPI_VERSION >= 4
-    #define BCM2708_PERI_BASE 0xFE000000
-#elif RPI_VERSION >= 2
-    #define BCM2708_PERI_BASE 0x3F000000
-#else
-    #define BCM2708_PERI_BASE 0x20000000
-#endif
-#define GPIO_BASE                (BCM2708_PERI_BASE + 0x200000) /* GPIO controller */
-
-// GPIO setup macros. Always use INP_GPIO(x) before using OUT_GPIO(x) or SET_GPIO_ALT(x,y)
-#define INP_GPIO(g) *(gpio+((g)/10)) &= ~(7<<(((g)%10)*3))
-#define OUT_GPIO(g) *(gpio+((g)/10)) |=  (1<<(((g)%10)*3))
-#define SET_GPIO_ALT(g,a) *(gpio+(((g)/10))) |= (((a)<=3?(a)+4:(a)==4?3:2)<<(((g)%10)*3))
-
-#define GPIO_SET(g) *(gpio+7) = 1<<(g) // sets   bits which are 1 ignores bits which are 0
-#define GPIO_CLR(g) *(gpio+10) = 1<<(g) // clears bits which are 1 ignores bits which are 0
-#define GPIO_READ(g) (*(gpio+13) >> (g)) & 0x00000001
-#define GPIO_READRAW *(gpio+13)
+#include <lgpio.h>
 
 //Perspective is from Device connected, so TDO is output from device to input into rpi
 #define JTAG_TMS 27 //PI ---> JTAG
@@ -40,9 +16,9 @@
 //-D DEBUG when compiling, will make all sleeps last 0.5 second, this can be used to test with LED on ports, or pushbuttons
 //Else sleeps can be reduced to increase speed
 #ifdef DEBUG
-#define WAIT 10000000 //aprox 0.5s
+#define WAIT 10000000 // approx 0.5s
 #else
-#define WAIT 1000 //aprox 0.5us
+#define WAIT 1000 // approx 0.5us
 #endif
 
 int setup_io();

@@ -1,202 +1,285 @@
 #include "rpjtag_io.h"
-#include <stdlib.h>
-#include <sys/mman.h>
-#include <stdio.h>
-#include <fcntl.h>
-#include <string.h>
-#include <unistd.h>
-//Credit for GPIO setup goes to http://elinux.org/RPi_Low-level_peripherals
-//
-// Set up a memory regions to access GPIO
-//
-int  mem_fd;
-void *gpio_map;
 
-// I/O access
-volatile unsigned *gpio;
+/*
+ * This version removes the /dev/mem and direct mmap approach
+ * and instead uses the lgpio library to toggle GPIO lines.
+ *
+ * The definitions below assume the same JTAG pins as in the original:
+ *   JTAG_TMS (BCM 27)
+ *   JTAG_TDI (BCM 22)
+ *   JTAG_TDO (BCM 23)
+ *   JTAG_TCK (BCM 24)
+ *
+ * The macros WAIT or debug logic remain the same, but direct register
+ * macros like GPIO_SET, GPIO_CLR, etc. are replaced by calls to lgpio.
+ */
 
+/* Perspective:
+ *   TMS: output from Pi -> device
+ *   TDI: output from Pi -> device
+ *   TDO: input  to  Pi <- device
+ *   TCK: output from Pi -> device
+ *
+ * We'll store line handles for each line separately.
+ */
+
+static int chip = -1;          // Handle for the gpiochip (e.g. /dev/gpiochip0)
+static int h_tck = -1;         // Line handle for TCK
+static int h_tms = -1;         // Line handle for TMS
+static int h_tdi = -1;         // Line handle for TDI
+static int h_tdo = -1;         // Line handle for TDO
+
+// We'll track TDI state in a global, just like original code
+static int tdi_state = -1;
+
+/* 
+ * The old code used macros like:
+ *   GPIO_SET(JTAG_TCK) 
+ *   GPIO_CLR(JTAG_TCK)
+ * We'll define tiny inline wrappers that do the same via lgpio.
+ */
+
+static inline void gpio_set_line(int line_handle)
+{
+    lgGpioWrite(line_handle, 1);
+}
+
+static inline void gpio_clr_line(int line_handle)
+{
+    lgGpioWrite(line_handle, 0);
+}
+
+static inline int gpio_read_line(int line_handle)
+{
+    return lgGpioRead(line_handle);
+}
+
+/*
+ * The original code had tick_clk(), which toggles TCK high then low.
+ * We'll keep that logic, but now just call our lgpio helpers.
+ */
 void tick_clk()
 {
-    GPIO_SET(JTAG_TCK);
-    //nop_sleep(WAIT); // throttle jtag for fast RPIs
-    GPIO_CLR(JTAG_TCK);
+    gpio_set_line(h_tck);
+    //nop_sleep(WAIT); // if needed, can throttle JTAG for debugging
+    gpio_clr_line(h_tck);
 }
 
-void close_io()
-{
-    munmap(gpio_map, BLOCK_SIZE);
-}
-
+/*
+ * Our replacement for setup_io() which used /dev/mem + mmap.
+ * Now we open the gpiochip, claim lines, etc.
+ */
 int setup_io()
 {
-    /* open /dev/mem */
-    if ((mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0)
-    {
-        printf("can't open /dev/mem \n");
+    // Usually the default chip is 0 = "/dev/gpiochip0"
+    chip = lgGpiochipOpen(0);
+    if (chip < 0) {
+        fprintf(stderr, "ERROR: lgGpiochipOpen(0) failed, rc=%d\n", chip);
         return -1;
     }
-    
-    /* mmap GPIO */
-    gpio_map = mmap(
-        NULL,                //Any adddress in our space will do
-        BLOCK_SIZE,          //Map length
-        PROT_READ|PROT_WRITE,// Enable reading & writting to mapped memory
-        MAP_SHARED,          //Shared with other processes
-        mem_fd,              //File to map
-        GPIO_BASE);
 
-    close(mem_fd); //No need to keep mem_fd open after mmap
-    
-    if (gpio_map == MAP_FAILED)
-    {
-        printf("mmap error %d\n", (int)gpio_map);
-        return -2;
+    // Claim JTAG_TCK as output
+    h_tck = lgGpioClaimOutput(chip, 0, JTAG_TCK, LG_LOW);
+    if (h_tck < 0) {
+        fprintf(stderr, "ERROR: claim line TCK=%d failed\n", JTAG_TCK);
+        goto fail;
     }
-    
-    // Always use volatile pointer!
-    gpio = (volatile unsigned *)gpio_map;
-    
-    INP_GPIO(JTAG_TCK);
-    INP_GPIO(JTAG_TMS);
-    INP_GPIO(JTAG_TDI);
-    INP_GPIO(JTAG_TDO); //Receive output from Device to rpi
 
-    nop_sleep(WAIT);
+    // Claim JTAG_TMS as output
+    h_tms = lgGpioClaimOutput(chip, 0, JTAG_TMS, LG_LOW);
+    if (h_tms < 0) {
+        fprintf(stderr, "ERROR: claim line TMS=%d failed\n", JTAG_TMS);
+        goto fail;
+    }
 
-    OUT_GPIO(JTAG_TDI); //Send data from rpi to Device
-    OUT_GPIO(JTAG_TMS);
-    OUT_GPIO(JTAG_TCK);
+    // Claim JTAG_TDI as output
+    h_tdi = lgGpioClaimOutput(chip, 0, JTAG_TDI, LG_LOW);
+    if (h_tdi < 0) {
+        fprintf(stderr, "ERROR: claim line TDI=%d failed\n", JTAG_TDI);
+        goto fail;
+    }
+
+    // Claim JTAG_TDO as input
+    h_tdo = lgGpioClaimInput(chip, 0, JTAG_TDO);
+    if (h_tdo < 0) {
+        fprintf(stderr, "ERROR: claim line TDO=%d failed\n", JTAG_TDO);
+        goto fail;
+    }
+
+    // Everything claimed successfully
+    tdi_state = -1;
+
+    // Optionally do nop_sleep(WAIT) if you want a small delay
     nop_sleep(WAIT);
 
     return 0;
+
+fail:
+    // If any claim failed, release any lines we did claim and close chip
+    if (h_tck >= 0) lgGpioFreeLine(h_tck);
+    if (h_tms >= 0) lgGpioFreeLine(h_tms);
+    if (h_tdi >= 0) lgGpioFreeLine(h_tdi);
+    if (h_tdo >= 0) lgGpioFreeLine(h_tdo);
+    if (chip >= 0)  lgGpiochipClose(chip);
+
+    h_tck = h_tms = h_tdi = h_tdo = -1;
+    chip  = -1;
+    return -1;
 }
 
+/*
+ * Our replacement for close_io() which used munmap().
+ * Now we just free lines and close the gpiochip.
+ */
+void close_io()
+{
+    if (h_tck >= 0) {
+        lgGpioFreeLine(h_tck);
+        h_tck = -1;
+    }
+    if (h_tms >= 0) {
+        lgGpioFreeLine(h_tms);
+        h_tms = -1;
+    }
+    if (h_tdi >= 0) {
+        lgGpioFreeLine(h_tdi);
+        h_tdi = -1;
+    }
+    if (h_tdo >= 0) {
+        lgGpioFreeLine(h_tdo);
+        h_tdo = -1;
+    }
+    if (chip >= 0) {
+        lgGpiochipClose(chip);
+        chip = -1;
+    }
+}
+
+/*
+ * read_jtag_tdo() in the old code would do:
+ *   return (GPIO_READ(JTAG_TDO)) ? 1 : 0;
+ */
 int read_jtag_tdo()
 {
-    return ( GPIO_READ(JTAG_TDO) ) ? 1 : 0;
+    // Just read the TDO line
+    int val = gpio_read_line(h_tdo);
+    return (val) ? 1 : 0;
 }
 
-int tdi=-1;
-
+/*
+ * send_cmd_no_tms: sets TDI then toggles TCK (like original).
+ */
 void send_cmd_no_tms(int iTDI)
 {
-    if(iTDI == 0)
-    {
-      if (tdi != 0)
-      {
-          GPIO_CLR(JTAG_TDI);
-          tdi = 0;
-      }
-    }
-    else
-    {
-        if (tdi != 1)
-        {
-            GPIO_SET(JTAG_TDI);
-            tdi = 1;
+    // Set TDI if it changed
+    if (iTDI == 0) {
+        if (tdi_state != 0) {
+            gpio_clr_line(h_tdi);
+            tdi_state = 0;
+        }
+    } else {
+        if (tdi_state != 1) {
+            gpio_set_line(h_tdi);
+            tdi_state = 1;
         }
     }
 
-    //nop_sleep(WAIT);
-    GPIO_SET(JTAG_TCK);
-    //nop_sleep(WAIT);
-    GPIO_CLR(JTAG_TCK);
-    //nop_sleep(WAIT);
+    // Now toggle TCK
+    gpio_set_line(h_tck);
+    gpio_clr_line(h_tck);
 }
 
-//void set_pin(int pin, int val)
-//{
-//    if (val == 0)
-//    {
-//        GPIO_CLR(pin);
-//    }
-//    else
-//    {
-//        GPIO_SET(pin);
-//    }
-//}
-
-void send_cmd(int iTDI,int iTMS)
+/*
+ * The old code's send_cmd(...) sets TDI, TMS, then calls tick_clk().
+ */
+void send_cmd(int iTDI, int iTMS)
 {
-    if(iTDI == 1)
-    {
-        GPIO_SET(JTAG_TDI);
-        tdi = 1;
-    }
-    else
-    {
-        GPIO_CLR(JTAG_TDI);
-        tdi = 0;
+    // TDI
+    if (iTDI == 1) {
+        gpio_set_line(h_tdi);
+        tdi_state = 1;
+    } else {
+        gpio_clr_line(h_tdi);
+        tdi_state = 0;
     }
 
-    if(iTMS == 1)
-    {
-        GPIO_SET(JTAG_TMS);
+    // TMS
+    if (iTMS == 1) {
+        gpio_set_line(h_tms);
+    } else {
+        gpio_clr_line(h_tms);
     }
-    else
-        GPIO_CLR(JTAG_TMS);
 
-    //nop_sleep(WAIT);
+    // Then do one clock cycle
     tick_clk();
-    //nop_sleep(WAIT);
 }
 
-
+/*
+ * reset_clk() can simply clear the TCK line
+ */
 void reset_clk()
 {
-    fprintf(stderr, "reseting clock at pin %d\n", JTAG_TCK);
-    GPIO_CLR(JTAG_TCK);
+    fprintf(stderr, "resetting clock at pin %d\n", JTAG_TCK);
+    gpio_clr_line(h_tck);
     fprintf(stderr, "done\n");
 }
 
+
+/*
+ * send_cmdWord_msb_first(...) / send_cmdWord_msb_last(...)
+ * remain the same conceptually, but use send_cmd(...) for toggling lines.
+ */
 //Mainly used for command words (CFG_IN)
-void send_cmdWord_msb_first(unsigned int cmd, int lastBit, int bitoffset) //Send data, example 0xFFFF,0,20 would send 20 1's, with not TMS
+//Send data, example 0xFFFF,0,20 would send 20 1's, with not TMS
+void send_cmdWord_msb_first(unsigned int cmd, int lastBit, int bitoffset)
 {
-    while(bitoffset--)
-    {
-        int x = ( cmd >> bitoffset) & 0x01;
-        send_cmd(x,(lastBit==1 && bitoffset==0));
+    while (bitoffset--) {
+        int x = (cmd >> bitoffset) & 0x01;
+        send_cmd(x, (lastBit == 1 && bitoffset == 0));
     }
 }
+
 
 //Mainly used for IR Register codes
-void send_cmdWord_msb_last(unsigned int cmd, int lastBit, int bitoffset) //Send data, example 0xFFFF,0,20 would send 20 1's, with not TMS
+//Send data, example 0xFFFF,0,20 would send 20 1's, with not TMS
+void send_cmdWord_msb_last(unsigned int cmd, int lastBit, int bitoffset)
 {
     int i;
-    for(i=0;i<bitoffset;i++)
-    {
-        int x = ( cmd >> i ) & 0x01;
-        send_cmd(x,(lastBit==1 && bitoffset==i+1));
+    for (i = 0; i < bitoffset; i++) {
+        int x = (cmd >> i) & 0x01;
+        send_cmd(x, (lastBit == 1 && (bitoffset == i+1)));
     }
 }
 
-void send_byte(unsigned char byte, int lastbyte) //Send single byte, example from fgetc
+/*
+ * send_byte(...) and send_byte_no_tms(...) also remain,
+ * but call send_cmd(...) or send_cmd_no_tms(...) for toggles.
+ * Send single byte, example from fgetc
+ */
+void send_byte(unsigned char byte, int lastbyte)
 {
     int x;
-        for(x=7;x>=0;x--)
-        {
-            send_cmd(byte>>x&0x01,( x==0) && (lastbyte==1));
-        }
+    for (x = 7; x >= 0; x--) {
+        send_cmd((byte >> x) & 0x01, ((x == 0) && (lastbyte == 1)));
+    }
 }
 
 void send_byte_no_tms(unsigned char byte)
 {
-    //int x;
-    //    for(x=7;x>=0;x--)
-    //    {
-    //        send_cmd_no_tms(byte>>x&0x01);
-    //    }
-    send_cmd_no_tms(byte&0x80);
-    send_cmd_no_tms(byte&0x40);
-    send_cmd_no_tms(byte&0x20);
-    send_cmd_no_tms(byte&0x10);
-    send_cmd_no_tms(byte&0x08);
-    send_cmd_no_tms(byte&0x04);
-    send_cmd_no_tms(byte&0x02);
-    send_cmd_no_tms(byte&0x01);
+    send_cmd_no_tms(byte & 0x80);
+    send_cmd_no_tms(byte & 0x40);
+    send_cmd_no_tms(byte & 0x20);
+    send_cmd_no_tms(byte & 0x10);
+    send_cmd_no_tms(byte & 0x08);
+    send_cmd_no_tms(byte & 0x04);
+    send_cmd_no_tms(byte & 0x02);
+    send_cmd_no_tms(byte & 0x01);
 }
 
-//Does a NOP call in BCM2708, and is meant to be run @ 750 MHz
+/*
+ * nop_sleep(...) still just does CPU nops
+ * Does a NOP call in BCM2708, and is meant to be run @ 750 MHz
+ */
 void nop_sleep(long x)
 {
     while (x--) {
@@ -204,20 +287,23 @@ void nop_sleep(long x)
     }
 }
 
-void jtag_read_data(char* data,int iSize)
+/*
+ * jtag_read_data(...) remains functionally the same,
+ * uses read_jtag_tdo() and send_cmd().
+ */
+void jtag_read_data(char* data, int iSize)
 {
-    if(iSize==0) return;
+    if (iSize == 0) return;
     int i, temp;
-    memset(data,0,(iSize+7)/8);
+    memset(data, 0, (iSize + 7) / 8);
 
-    for(i=iSize-1; i>0; i--)
-    {
+    for (i = iSize - 1; i > 0; i--) {
         temp = read_jtag_tdo();
-        send_cmd(0,0);
-        data[i/8] |= (temp << (i & 7));
+        send_cmd(0, 0);
+        data[i / 8] |= (temp << (i & 7));
     }
 
-    temp = read_jtag_tdo(); //Read last bit, while also going to EXIT
-    send_cmd(0,1);
+    temp = read_jtag_tdo(); // read last bit while also going to EXIT
+    send_cmd(0, 1);
     data[0] |= temp;
 }
